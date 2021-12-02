@@ -15,4 +15,6 @@ count argument which tells it how many clients to simulate.
 
 To benchmark, try the different backends with different thread counts! On my system, threadpool_backend
 handled up to around 64 concurrent clients, while at that level twothread_backend was dropping packets
-left and right.
+left and right. If a client doesn't get the same packet it send back within the 3 frame window, the
+script will tell you that, which would reflect the server being overloaded. If the clients don't output
+anything, you know the server is serving packets within the 3 frame window!
