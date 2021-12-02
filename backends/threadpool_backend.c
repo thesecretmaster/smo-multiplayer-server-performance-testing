@@ -6,6 +6,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/sysinfo.h>
+#include <unistd.h>
 #include "../queues/queue.h"
 #include "../packet_meta.h"
 
@@ -92,7 +93,7 @@ void *threadpool_thread(void *_v) {
 	while (epoll_wait(epoll_fd, &ep_ev, 1, -1) >= 1) {
 		// Read the packet from the descriptor
 		retval = recv(ep_ev.data.fd, buf, BUFLEN, MSG_WAITALL);
-		if (retval >= 0) {
+		if (retval > 0) {
 			printf("%d: Got packet %s\n", ep_ev.data.fd, buf);
 			// Send the packet out to every socket that is currently connected
 			for (int i = 0; i < fd_idx; i++) {
@@ -118,6 +119,8 @@ void *threadpool_thread(void *_v) {
 		} else {
 			// If we couldn't read, we mark it as closed. We need to search for the correct
 			// element because we don't know the index
+			epoll_ctl(epoll_fd, EPOLL_CTL_DEL, ep_ev.data.fd, NULL);
+			close(ep_ev.data.fd);
 			for (int i = 0; i < fd_idx; i++)
 				if (connected_fds[i].fd == ep_ev.data.fd)
 					connected_fds[i].open = false;
