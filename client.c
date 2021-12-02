@@ -7,6 +7,8 @@
 #include <stdbool.h>
 #include <unistd.h>
 
+// We want to simulate a 60fps game submitting a packet every 3 frames
+// This is in microseconds because that's what `usleep` takes
 #define WAIT_TIME ((1000000 /* microseconds in 1 second */ / 60 /* fps */) * 3 /* frames between sends */)
 
 int main() {
@@ -40,6 +42,7 @@ int main() {
 	int i = 0;
 	while (true) {
 		sent_len = 0;
+		// Send a packet with only a packet number string inside
 		printf("Sending packet %d\n", i);
 		snprintf(buf, BUFLEN, "%d", i);
 		while (sent_len < BUFLEN) {
