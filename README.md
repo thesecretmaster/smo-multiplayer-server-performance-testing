@@ -6,3 +6,6 @@ are in the `backends` folder and the implimentations for the queues are in the `
 
 To compile and run the code, use `python setup.py --queue <queue> --backend <backend>`. To see the
 list of backends and queues, run `python setup.py --help`. Try them out!
+
+To run the server, compile it and then run `./server`. To run a simulated client, run `./client`.
+You can run as many clients as you like, and they will all log their activity.
