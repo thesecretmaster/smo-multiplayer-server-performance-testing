@@ -9,4 +9,5 @@ list of backends and queues, run `python setup.py --help`. Try them out!
 
 To run the server, compile it and then run `./server`. To run a simulated client, run `./client`.
 You can run as many clients as you like. Both the server and client executables will log their
-activity to STDOUT.
+activity to STDOUT. Both the client and the server take port and host arguments via `-p 8080`
+and `-h 127.0.0.1` (which are the defaults).
