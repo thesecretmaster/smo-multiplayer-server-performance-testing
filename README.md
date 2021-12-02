@@ -10,4 +10,9 @@ list of backends and queues, run `python setup.py --help`. Try them out!
 To run the server, compile it and then run `./server`. To run a simulated client, run `./client`.
 You can run as many clients as you like. Both the server and client executables will log their
 activity to STDOUT. Both the client and the server take port and host arguments via `-p 8080`
-and `-h 127.0.0.1` (which are the defaults).
+and `-h 127.0.0.1` (which are the defaults), and the client takes an additional `-t 64` thread
+count argument which tells it how many clients to simulate.
+
+To benchmark, try the different backends with different thread counts! On my system, threadpool_backend
+handled up to around 64 concurrent clients, while at that level twothread_backend was dropping packets
+left and right.
