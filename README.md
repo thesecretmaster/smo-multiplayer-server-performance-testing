@@ -8,4 +8,5 @@ To compile and run the code, use `python setup.py --queue <queue> --backend <bac
 list of backends and queues, run `python setup.py --help`. Try them out!
 
 To run the server, compile it and then run `./server`. To run a simulated client, run `./client`.
-You can run as many clients as you like, and they will all log their activity.
+You can run as many clients as you like. Both the server and client executables will log their
+activity to STDOUT.
