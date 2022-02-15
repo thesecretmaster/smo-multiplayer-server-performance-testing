@@ -29,9 +29,6 @@
  * I would normally try to summerize the code in a little more detail, but this code is quite
  * complex. The TL;DR is that we take the `epoll` approach from `threadpool_backend` and
  * expand upon it.
- *
- * NOTE: There's a lot of room for optimization here!
- *   - Slow clients will KILL the send queue. This NEEDS to be fixed.
  */
 
 #ifdef DEBUG
@@ -225,13 +222,13 @@ sock_close:
 				char *send_buf = malloc(sizeof(char) * (visited_len * BUFLEN));
 				while (visited_idx < visited_len) {
 					spins += 1;
-					if (!connected_fds[client_idx].open) {
-						client_idx = (client_idx + 1) % fd_idx;
-						continue;
-					}
 					// Failsafe in case we're just getting absolutely fucked, we can't stall too long
 					if (spins >= maxspins) {
 						break;
+					}
+					if (!connected_fds[client_idx].open) {
+						client_idx = (client_idx + 1) % fd_idx;
+						continue;
 					}
 					bool is_visited = false;
 					for (int i = 0; i < visited_idx; i++) {
