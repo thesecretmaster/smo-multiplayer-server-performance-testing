@@ -51,7 +51,7 @@ void backend_setup(void) {
 
 	// Spawn all of the threads for the threadpool, one for each CPU core
 	pthread_t pid;
-	for (int i = 0; i < get_nprocs(); i++)
+	for (int i = 0; i < /*get_nprocs()*/ 4; i++)
 		pthread_create(&pid, NULL, &threadpool_thread, NULL);
 }
 

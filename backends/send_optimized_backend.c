@@ -10,6 +10,7 @@
 #include <stdbool.h>
 #include <sys/timerfd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include "../packet_meta.h"
 
 /* This backend is the most optimal of them all, in that it resolves the major scaling
@@ -31,9 +32,9 @@
  * expand upon it.
  */
 
+#define DEBUG
 #ifdef DEBUG
-#define debug_print(...) \
-            do { if (DEBUG) fprintf(stderr, __VA_ARGS__); } while (0)
+#define debug_print(...) printf(__VA_ARGS__);
 #else
 #define debug_print(fmt, ...)
 #endif
@@ -117,7 +118,7 @@ void backend_setup(void) {
 
 	// Spawn all of the threads for the threadpool, one for each CPU core
 	pthread_t pid;
-	for (int i = 0; i < get_nprocs(); i++)
+	for (int i = 0; i < /*get_nprocs()*/ 4; i++)
 		pthread_create(&pid, NULL, &threadpool_thread, NULL);
 }
 
@@ -138,6 +139,9 @@ static struct client_lastread *lastread_init() {
 void backend_newfd(int fd) {
 	// Add the connection to the fd list
 	debug_print("Got connected on fd %d\n", fd);
+	int sndbuf_size = 1024 * (4 * 8);
+	setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf_size, sizeof(sndbuf_size));
+	fcntl(fd, O_NONBLOCK);
 	int idx = fd_idx;
 	fd_idx += 1;
 	connected_fds[idx].fd = fd;
