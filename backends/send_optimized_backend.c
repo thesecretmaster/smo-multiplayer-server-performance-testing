@@ -277,6 +277,8 @@ static bool start_send(struct epoll_event ep_ev, struct epoll_event_data *ep_tra
 		ep_part_send_event.data.ptr = part_send_data;
 		ep_part_send_event.events = EPOLLOUT | EPOLLONESHOT;
 		epoll_ctl(epoll_fd, EPOLL_CTL_ADD, part_send_data->fd, &ep_part_send_event);
+	} else {
+		free(send_buf);
 	}
 	ep_ev.events = EPOLLIN | EPOLLONESHOT;
 	epoll_ctl(epoll_fd, EPOLL_CTL_MOD, ep_tracking_data_in->fd, &ep_ev);
