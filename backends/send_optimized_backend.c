@@ -32,7 +32,6 @@
  * expand upon it.
  */
 
-#define DEBUG
 #ifdef DEBUG
 #define debug_print(...) printf(__VA_ARGS__);
 #else
@@ -56,7 +55,14 @@ struct client_lastread {
 	struct lastread_buffer buffers[BUF_CNT];
 };
 
+struct send_start {
+	int fd;
+	volatile bool send_in_progress;
+};
+
 struct send_progress {
+	int original_fd; // For closing
+	volatile bool *send_in_progress; // For signaling send is done
 	int send_fd;
 	int read_fd_idx;
 	int next_byte_idx;
@@ -75,7 +81,7 @@ enum event_type {
 union event_data {
 	volatile struct client_lastread *read_state;
 	struct send_progress *send_state;
-	int send_start_fd;
+	struct send_start *send_init;
 };
 
 struct epoll_event_data {
@@ -173,10 +179,13 @@ void backend_newfd(int fd) {
 		.it_value = send_rate
 	};
 	timerfd_settime(timer, 0x0, &ts, NULL);
+	struct send_start *si = malloc(sizeof(struct send_start));
+	si->fd = fd;
+	si->send_in_progress = false;
 	data = malloc(sizeof(struct epoll_event_data));
 	data->fd = timer;
 	data->type = EPOLL_EV_SEND_START;
-	data->data.send_start_fd = fd;
+	data->data.send_init = si;
 	ep_event.data.ptr = data;
 	ep_event.events = EPOLLIN | EPOLLONESHOT;
 	epoll_ctl(epoll_fd, EPOLL_CTL_ADD, timer, &ep_event);
@@ -196,16 +205,28 @@ static void close_sock(int fd, bool is_sock) {
 	// If we couldn't read, we mark it as closed. We need to search for the correct
 	// element because we don't know the index
 	epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
-	close(fd);
-	for (int i = 0; i < fd_idx; i++)
-		if (connected_fds[i].fd == fd)
-			connected_fds[i].open = false;
+	if (close(fd) != 0) {
+		printf("Close error %d\n", errno);
+	}
+	if (is_sock)
+		for (int i = 0; i < fd_idx; i++)
+			if (connected_fds[i].fd == fd)
+				connected_fds[i].open = false;
 	debug_print("%d removed from epoll list\n", fd);
 }
 
 static bool start_send(struct epoll_event ep_ev, struct epoll_event_data *ep_tracking_data_in) {
+	// If there's already a partial send pending, we're gonna let it finish before
+	// we send it more data
 	unsigned long expire_cnt;
 	read(ep_tracking_data_in->fd, &expire_cnt, 8);
+	if (__atomic_load_n(&ep_tracking_data_in->data.send_init->send_in_progress, __ATOMIC_SEQ_CST)) {
+		ep_ev.events = EPOLLIN | EPOLLONESHOT;
+		if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, ep_tracking_data_in->fd, &ep_ev) != 0) {
+			printf("Error adding timer fd back to epoll %d\n", errno);
+		}
+		return false;
+	}
 	int visited_len = client_count;
 	int visited[visited_len];
 	memset(visited, 0, sizeof(visited));
@@ -255,57 +276,76 @@ static bool start_send(struct epoll_event ep_ev, struct epoll_event_data *ep_tra
 		client_idx = (client_idx + 1) % fd_idx;
 	}
 	debug_print("Sending %d events on %d\n", visited_idx, ep_tracking_data_in->fd);
-	int sent_bytes = send(ep_tracking_data_in->data.send_start_fd, send_buf, BUFLEN * visited_idx, MSG_NOSIGNAL);
-	if (sent_bytes == -1) {
-		debug_print("Can't send on %d, closing\n", ep_tracking_data_in->data.send_start_fd);
-		close_sock(ep_tracking_data_in->data.send_start_fd, true);
+	int sent_bytes = send(ep_tracking_data_in->data.send_init->fd, send_buf, BUFLEN * visited_idx, MSG_NOSIGNAL);
+	if (sent_bytes == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
+		printf("Can't send on %d, closing (errno %d)\n", ep_tracking_data_in->data.send_init->fd, errno);
+		close_sock(ep_tracking_data_in->data.send_init->fd, true);
 		close_sock(ep_tracking_data_in->fd, false);
 		return false;
 	} else if (sent_bytes != BUFLEN * visited_idx) {
 		// Partial send time B-)
+		if (errno == EAGAIN || errno == EWOULDBLOCK)
+			sent_bytes = 0;
+		__atomic_store_n(&ep_tracking_data_in->data.send_init->send_in_progress, true, __ATOMIC_SEQ_CST);
 		struct send_progress *ss = malloc(sizeof(struct send_progress));
-		ss->send_fd = dup(ep_tracking_data_in->data.send_start_fd); // Dup so we can reg it to epoll multiple times
+		ss->original_fd = ep_tracking_data_in->data.send_init->fd;
+		ss->send_fd = dup(ep_tracking_data_in->data.send_init->fd); // Dup so we can reg it to epoll multiple times
+		if (ss->send_fd < 0) {
+			printf("Error duping %d (%d)\n", ep_tracking_data_in->data.send_init->fd, errno);
+		}
 		ss->data = send_buf;
+		ss->send_in_progress = &ep_tracking_data_in->data.send_init->send_in_progress;
 		ss->next_byte_idx = sent_bytes;
 		ss->data_length = BUFLEN * visited_idx;
+		printf("Partial send, %d / %d bytes sent (dupfd: %d)\n", sent_bytes, BUFLEN * visited_idx, ss->send_fd);
+		debug_print("Duped %d to %d\n", ep_tracking_data_in->data.send_init->fd, ss->send_fd);
 		struct epoll_event ep_part_send_event;
 		struct epoll_event_data *part_send_data = malloc(sizeof(struct epoll_event_data));
 		part_send_data->fd = ss->send_fd;
-		debug_print("Duped %d to %d\n", ep_tracking_data_in->data.send_start_fd, part_send_data->fd);
 		part_send_data->type = EPOLL_EV_SEND_CONTINUE;
 		part_send_data->data.send_state = ss;
 		ep_part_send_event.data.ptr = part_send_data;
 		ep_part_send_event.events = EPOLLOUT | EPOLLONESHOT;
-		epoll_ctl(epoll_fd, EPOLL_CTL_ADD, part_send_data->fd, &ep_part_send_event);
+		if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, part_send_data->fd, &ep_part_send_event) != 0) {
+			printf("Error adding partial send to epoll %d\n", errno);
+		}
 	} else {
 		free(send_buf);
 	}
 	ep_ev.events = EPOLLIN | EPOLLONESHOT;
-	epoll_ctl(epoll_fd, EPOLL_CTL_MOD, ep_tracking_data_in->fd, &ep_ev);
+	if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, ep_tracking_data_in->fd, &ep_ev) != 0) {
+		printf("Error adding timer fd back to epoll %d\n", errno);
+	}
 	return true;
 }
 
 static bool send_continue(struct epoll_event ep_ev, struct send_progress *ss) {
 	debug_print("GOT SEND CONT %d of %d bytes\n", ss->send_fd, ss->data_length - ss->next_byte_idx);
 	int sent_bytes = send(ss->send_fd, ss->data + ss->next_byte_idx, ss->data_length - ss->next_byte_idx, MSG_NOSIGNAL);
-	if (sent_bytes == -1) {
-		debug_print("Can't send on %d, closing\n", ss->send_fd);
-		close_sock(ss->send_fd, true);
+	if (sent_bytes == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
+		__atomic_store_n(ss->send_in_progress, true, __ATOMIC_SEQ_CST);
+		printf("Can't send on %d, closing\n", ss->send_fd);
+		close_sock(ss->send_fd, false);
+		close_sock(ss->original_fd, true);
+		free(ss->data);
+		free(ss);
 		return false;
 	} else {
+		if (sent_bytes == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
+			sent_bytes = 0;
 		ss->next_byte_idx += sent_bytes;
 		if (ss->next_byte_idx == ss->data_length) {
-			debug_print("Send complete on %d, closing\n", ss->send_fd);
+			__atomic_store_n(ss->send_in_progress, true, __ATOMIC_SEQ_CST);
+			printf("Send complete on %d, closing\n", ss->send_fd);
 			close_sock(ss->send_fd, false);
 			free(ss->data);
 			free(ss);
 			return false;
 		} else {
-			ep_ev.events = EPOLLOUT | EPOLLONESHOT;
-			epoll_ctl(epoll_fd, EPOLL_CTL_ADD, ss->send_fd, &ep_ev);
+			printf("%d FD | %d - %d bytes left to send, re-adding (sb %d, errno %d)\n", ss->send_fd, ss->data_length, ss->next_byte_idx, sent_bytes, errno);
+			return true;
 		}
 	}
-	return true;
 }
 
 static bool recv_idk(struct epoll_event ep_ev, struct epoll_event_data *ep_tracking_data_in) {
@@ -322,11 +362,13 @@ static bool recv_idk(struct epoll_event ep_ev, struct epoll_event_data *ep_track
 		if (rcv_hotbuf_len < BUFLEN) {
 			int rcv_rv = recv(ep_tracking_data_in->fd, rcv_hotbuf + rcv_hotbuf_len, BUFLEN - rcv_hotbuf_len, 0x0);
 			if (rcv_rv == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
-				debug_print("Bad sock close\n");
+				printf("Bad sock close\n");
+				__atomic_store_n(&lr->buffers[low_vers_idx].write_in_progress, false, __ATOMIC_SEQ_CST);
 				close_sock(ep_tracking_data_in->fd, true);
 				return false;
 			} else if (rcv_rv == 0) {
-				debug_print("Good sock close\n");
+				printf("Good sock close\n");
+				__atomic_store_n(&lr->buffers[low_vers_idx].write_in_progress, false, __ATOMIC_SEQ_CST);
 				close_sock(ep_tracking_data_in->fd, true);
 				return false;
 			} else {
@@ -338,11 +380,13 @@ static bool recv_idk(struct epoll_event ep_ev, struct epoll_event_data *ep_track
 	if (rcv_hotbuf_len == 0) {
 		rcv_rv = recv(ep_tracking_data_in->fd, (char*)lr->buffers[low_vers_idx].buffer + lr->write_progress, BUFLEN - lr->write_progress, 0x0);
 		if (rcv_rv == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
-			debug_print("Bad sock close\n");
+			printf("Bad sock close\n");
 			close_sock(ep_tracking_data_in->fd, true);
+			__atomic_store_n(&lr->buffers[low_vers_idx].write_in_progress, false, __ATOMIC_SEQ_CST);
 			return false;
 		} else if (rcv_rv == 0) {
-			debug_print("Good sock close\n");
+			printf("Good sock close\n");
+			__atomic_store_n(&lr->buffers[low_vers_idx].write_in_progress, false, __ATOMIC_SEQ_CST);
 			close_sock(ep_tracking_data_in->fd, true);
 			return false;
 		}
@@ -362,7 +406,9 @@ static bool recv_idk(struct epoll_event ep_ev, struct epoll_event_data *ep_track
 		debug_print("Recv complete on %d\n", ep_tracking_data_in->fd);
 	}
 	ep_ev.events = EPOLLIN | EPOLLONESHOT;
-	epoll_ctl(epoll_fd, EPOLL_CTL_MOD, ep_tracking_data_in->fd, &ep_ev);
+	if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, ep_tracking_data_in->fd, &ep_ev) != 0) {
+		printf("Error adding recv back to epoll %d\n", errno);
+	}
 	return true;
 }
 
@@ -379,7 +425,14 @@ void *threadpool_thread(void *_v) {
 				break;
 			}
 			case EPOLL_EV_SEND_CONTINUE : {
-				send_continue(ep_ev, ep_tracking_data_in->data.send_state);
+				if (!send_continue(ep_ev, ep_tracking_data_in->data.send_state)) {
+					free(ep_tracking_data_in);
+				} else {
+					ep_ev.events = EPOLLOUT | EPOLLONESHOT;
+					if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, ep_tracking_data_in->fd, &ep_ev) != 0) {
+						printf("Error adding partial send back to epoll %d (%d)\n", errno, ep_tracking_data_in->fd);
+					}
+				}
 				break;
 			}
 			case EPOLL_EV_READABLE : {
