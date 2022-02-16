@@ -39,6 +39,7 @@
 #endif
 
 #define BUF_CNT 2
+#define MAX_CLIENT_COUNT 1024
 
 struct lastread_buffer {
 	int version;
@@ -58,6 +59,7 @@ struct client_lastread {
 struct send_start {
 	int fd;
 	volatile bool send_in_progress;
+	int last_seen_list[MAX_CLIENT_COUNT];
 };
 
 struct send_progress {
@@ -100,7 +102,7 @@ struct fd_info {
 
 // All connected fds and an idx to indicate how far into the list we've gotten
 // We don't handle overflow of this array because this is just a test example
-static volatile struct fd_info connected_fds[1024];
+static volatile struct fd_info connected_fds[MAX_CLIENT_COUNT];
 static volatile int fd_idx = 0;
 static volatile int client_count = 0;
 // Global storage for the epoll struct. We could also pass this into the threads
@@ -172,7 +174,7 @@ void backend_newfd(int fd) {
 	int timer = timerfd_create(CLOCK_REALTIME, 0x0);
 	const struct timespec send_rate = {
 		.tv_sec = 0,
-		.tv_nsec = 50000000
+		.tv_nsec = 30000000 + (rand() % 100000)
 	};
 	const struct itimerspec ts = {
 		.it_interval = send_rate,
@@ -182,6 +184,7 @@ void backend_newfd(int fd) {
 	struct send_start *si = malloc(sizeof(struct send_start));
 	si->fd = fd;
 	si->send_in_progress = false;
+	memset(si->last_seen_list, 0, sizeof(si->last_seen_list));
 	data = malloc(sizeof(struct epoll_event_data));
 	data->fd = timer;
 	data->type = EPOLL_EV_SEND_START;
@@ -236,15 +239,18 @@ static bool start_send(struct epoll_event ep_ev, struct epoll_event_data *ep_tra
 	int maxspins = client_count * 4;
 	char *send_buf = malloc(sizeof(char) * (visited_len * BUFLEN));
 	while (visited_idx < visited_len) {
-		spins += 1;
 		// Failsafe in case we're just getting absolutely fucked, we can't stall too long
+		spins += 1;
 		if (spins >= maxspins) {
 			break;
 		}
+		// Skip closed sockets
 		if (!connected_fds[client_idx].open) {
 			client_idx = (client_idx + 1) % fd_idx;
 			continue;
 		}
+		// Skip sockets that have already been read ("visited")
+		// Could go from O(n) to O(1) with bitmap
 		bool is_visited = false;
 		for (int i = 0; i < visited_idx; i++) {
 			if (client_idx == visited[i]) {
@@ -256,7 +262,8 @@ static bool start_send(struct epoll_event ep_ev, struct epoll_event_data *ep_tra
 			client_idx = (client_idx + 1) % fd_idx;
 			continue;
 		}
-		spins = 0;
+		// Ok, we haven't seen it before!
+		// Get the highest version so we can read from it
 		int high_vers_idx;
 		int high_vers = -1;
 		for (int i = 0; i < BUF_CNT; i++) {
@@ -265,13 +272,23 @@ static bool start_send(struct epoll_event ep_ev, struct epoll_event_data *ep_tra
 				high_vers = connected_fds[client_idx].lastread_data->buffers[i].version;
 			}
 		}
+		// If we've seen this version before, don't send it again
+		if (ep_tracking_data_in->data.send_init->last_seen_list[client_idx] >= high_vers) {
+			continue;
+		}
+		// This is actual real new data! We can reset the spin counter for this one, because it's ok to spin on failure.
+		spins = 0;
+		// Attempt to read data
 		__atomic_fetch_add(&connected_fds[client_idx].lastread_data->buffers[high_vers_idx].reader_count, 1, __ATOMIC_SEQ_CST);
 		if (__atomic_load_n(&connected_fds[client_idx].lastread_data->buffers[high_vers_idx].write_in_progress, __ATOMIC_SEQ_CST)) {
+			// Fail. Don't add to visited so that we try again.
 			__atomic_fetch_sub(&connected_fds[client_idx].lastread_data->buffers[high_vers_idx].reader_count, 1, __ATOMIC_SEQ_CST);
 		} else {
 			memcpy(send_buf + (BUFLEN * visited_idx), (char*)connected_fds[client_idx].lastread_data->buffers[high_vers_idx].buffer, BUFLEN);
 			__atomic_fetch_sub(&connected_fds[client_idx].lastread_data->buffers[high_vers_idx].reader_count, 1, __ATOMIC_SEQ_CST);
+			// Set visited to ensure we don't copy into the buffer again
 			visited[visited_idx += 1] = client_idx;
+			ep_tracking_data_in->data.send_init->last_seen_list[client_idx] = high_vers;
 		}
 		client_idx = (client_idx + 1) % fd_idx;
 	}
