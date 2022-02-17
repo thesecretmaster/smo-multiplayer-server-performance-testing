@@ -115,6 +115,7 @@ struct room {
 	int client_idx;
 	struct room_settings settings;
 	struct fd_info clients[MAX_CLIENT_COUNT];
+	pthread_mutex_t instasend_send_locks[MAX_CLIENT_COUNT];
 };
 
 #define MAX_ROOM_COUNT 1024
@@ -140,15 +141,17 @@ void backend_setup(void) {
 		pthread_create(&pid, NULL, &threadpool_thread, NULL);
 }
 
-static struct room *room_init() {
+static struct room *room_init(bool instasend) {
 	struct room *room = malloc(sizeof(struct room));
 	room->client_count = 0;
 	room->client_idx = 0;
-	room->settings.instasend = true;
+	room->settings.instasend = instasend;
 	for (int i = 0; i < sizeof(room->clients) / sizeof(room->clients[0]); i++) {
 		room->clients[i].fd = -1;
 		room->clients[i].open = false;
 		room->clients[i].lastread_data = NULL;
+		if (instasend)
+			pthread_mutex_init(&room->instasend_send_locks[i], NULL);
 	}
 	return room;
 }
@@ -182,7 +185,7 @@ void backend_newfd(int fd) {
 		room = roomlist[room_idx];
 	} else {
 		volatile struct room *old_room = NULL;
-		room = room_init();
+		room = room_init(true);
 		if (!__atomic_compare_exchange_n(&roomlist[room_idx], &old_room, room, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
 			free((struct room*)room);
 			room = old_room;
@@ -197,9 +200,11 @@ void backend_newfd(int fd) {
 		return;
 	}
 	debug_print("Sucessfully connected on fd %d\n", fd);
-	int sndbuf_size = 1024 * (4 * 2);
-	setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf_size, sizeof(sndbuf_size));
-	fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+	if (!room->settings.instasend) {
+		int sndbuf_size = 1024 * (4 * 2);
+		setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf_size, sizeof(sndbuf_size));
+		fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+	}
 	room->clients[idx].fd = fd;
 	room->clients[idx].lastread_data = lastread_init();
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
@@ -484,38 +489,40 @@ static enum EP_EV_RETVAL instasend_handler(int recv_fd, volatile struct room *ro
 	packet.length = sizeof(buf);
 	// Read the packet from the descriptor
 	retval = recv(recv_fd, buf, BUFLEN, MSG_WAITALL);
-	if (retval > 0) {
-		debug_print("%d: Got packet %s\n", recv_fd, buf);
-		// Send the packet out to every socket that is currently connected
-		for (int i = 0; i < room->client_idx; i++) {
-			// Skip if the connection is closed
-			if (!room->clients[i].open)
-				continue;
-			packet.src_fd = recv_fd;
-			packet.data = buf;
-
-			// Handle partial threads
-			sent_len = 0;
-			while (sent_len < packet.length) {
-				retval = send(room->clients[i].fd, packet.data + sent_len, packet.length - sent_len, MSG_NOSIGNAL);
-				if (retval == 0 || (retval < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
-					printf("Instasend close %d=%d (%d)\n", recv_fd, retval, errno);
-					close_sock(recv_fd, room, true);
-					return EP_EV_DONT_REARM;
-				} else {
-					sent_len += retval;
-				}
-			}
-		}
-		debug_print("%d: Finished sending out packet %s\n", recv_fd, buf);
-		return EP_EV_REARM;
-	} else {
+	if (retval <= 0) {
 		// If we couldn't read, we mark it as closed. We need to search for the correct
 		// element because we don't know the index
 		printf("Instasend close %d=%d (%d)\n", recv_fd, retval, errno);
 		close_sock(recv_fd, room, true);
 		return EP_EV_DONT_REARM;
 	}
+	debug_print("%d: Got packet %s\n", recv_fd, buf);
+	// Send the packet out to every socket that is currently connected
+	for (int i = 0; i < room->client_idx; i++) {
+		// Skip if the connection is closed
+		if (!room->clients[i].open)
+			continue;
+		packet.src_fd = recv_fd;
+		packet.data = buf;
+
+		// Handle partial threads
+		pthread_mutex_lock((pthread_mutex_t*)&room->instasend_send_locks[i]);
+		sent_len = 0;
+		while (sent_len < packet.length) {
+			retval = send(room->clients[i].fd, packet.data + sent_len, packet.length - sent_len, MSG_NOSIGNAL);
+			if (retval == 0 || (retval < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+				printf("Instasend close %d=%d (%d)\n", recv_fd, retval, errno);
+				close_sock(room->clients[i].fd, room, true);
+				pthread_mutex_unlock((pthread_mutex_t*)&room->instasend_send_locks[i]);
+				return EP_EV_DONT_REARM;
+			} else {
+				sent_len += retval;
+			}
+		}
+		pthread_mutex_unlock((pthread_mutex_t*)&room->instasend_send_locks[i]);
+	}
+	debug_print("%d: Finished sending out packet %s\n", recv_fd, buf);
+	return EP_EV_REARM;
 }
 
 void *threadpool_thread(void *_v) {
