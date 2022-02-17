@@ -86,8 +86,10 @@ union event_data {
 	struct send_start *send_init;
 };
 
+struct room;
 struct epoll_event_data {
 	int fd;
+	volatile struct room *room;
 	enum event_type type;
 	union event_data data;
 };
@@ -100,16 +102,18 @@ enum EP_EV_RETVAL {
 // Keep track of a connection and it's fd
 struct fd_info {
 	int fd;
-	bool readready;
 	bool open;
 	volatile struct client_lastread *lastread_data;
 };
 
-// All connected fds and an idx to indicate how far into the list we've gotten
-// We don't handle overflow of this array because this is just a test example
-static volatile struct fd_info connected_fds[MAX_CLIENT_COUNT];
-static volatile int fd_idx = 0;
-static volatile int client_count = 0;
+struct room {
+	int client_count;
+	int client_idx;
+	struct fd_info clients[MAX_CLIENT_COUNT];
+};
+
+#define MAX_ROOM_COUNT 1024
+static volatile struct room * volatile roomlist[MAX_ROOM_COUNT];
 // Global storage for the epoll struct. We could also pass this into the threads
 // but I'm lazy.
 static int epoll_fd;
@@ -117,12 +121,8 @@ static int epoll_fd;
 void *threadpool_thread(void*);
 // Called at server startup
 void backend_setup(void) {
-	// Initialize the connected fd list
-	for (int i = 0; i < sizeof(connected_fds) / sizeof(connected_fds[0]); i++) {
-		connected_fds[i].fd = -1;
-		connected_fds[i].open = false;
-		connected_fds[i].readready = false;
-		connected_fds[i].lastread_data = NULL;
+	for (int i = 0; i < MAX_ROOM_COUNT; i++) {
+		roomlist[i] = NULL;
 	}
 
 	// Setup the epoll instance, size hint of 1024 because that's the connecte fd size
@@ -133,6 +133,18 @@ void backend_setup(void) {
 	pthread_t pid;
 	for (int i = 0; i < get_nprocs(); i++)
 		pthread_create(&pid, NULL, &threadpool_thread, NULL);
+}
+
+static struct room *room_init() {
+	struct room *room = malloc(sizeof(struct room));
+	room->client_count = 0;
+	room->client_idx = 0;
+	for (int i = 0; i < sizeof(room->clients) / sizeof(room->clients[0]); i++) {
+		room->clients[i].fd = -1;
+		room->clients[i].open = false;
+		room->clients[i].lastread_data = NULL;
+	}
+	return room;
 }
 
 static struct client_lastread *lastread_init() {
@@ -150,16 +162,42 @@ static struct client_lastread *lastread_init() {
 
 // Called every time a new connection is accepted
 void backend_newfd(int fd) {
-	// Add the connection to the fd list
-	debug_print("Got connected on fd %d\n", fd);
+	// Authenticate this new fd
+	char auth_buf[4];
+	auth_buf[sizeof(auth_buf) - 1] = '\0';
+	recv(fd, auth_buf, sizeof(auth_buf) - 1, MSG_WAITALL);
+	long room_idx = strtol(auth_buf, NULL, 10);
+	if (room_idx >= sizeof(roomlist)) {
+		// Can't have a room index past the end of the list
+		return;
+	}
+	volatile struct room *room;
+	if (__atomic_load_n(&roomlist[room_idx], __ATOMIC_SEQ_CST) != NULL) {
+		room = roomlist[room_idx];
+	} else {
+		volatile struct room *old_room = NULL;
+		room = room_init();
+		if (!__atomic_compare_exchange_n(&roomlist[room_idx], &old_room, room, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+			free((struct room*)room);
+			room = old_room;
+		}
+	}
+	printf("Authed to room %ld (%p)\n", room_idx, room);
+	// Auth is complete! Hock up the fd!
+	int idx = __atomic_fetch_add(&room->client_idx, 1, __ATOMIC_SEQ_CST);
+	if (idx >= MAX_CLIENT_COUNT) {
+		close(fd);
+		printf("Could not add client, already too many clients\n");
+		return;
+	}
+	debug_print("Sucessfully connected on fd %d\n", fd);
 	int sndbuf_size = 1024 * (4 * 2);
 	setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf_size, sizeof(sndbuf_size));
 	fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
-	int idx = fd_idx;
-	fd_idx += 1;
-	connected_fds[idx].fd = fd;
-	connected_fds[idx].open = true;
-	connected_fds[idx].lastread_data = lastread_init();
+	room->clients[idx].fd = fd;
+	room->clients[idx].lastread_data = lastread_init();
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	room->clients[idx].open = true;
 
 
 	struct epoll_event ep_event;
@@ -169,8 +207,9 @@ void backend_newfd(int fd) {
 	// will only wake up one thread
 	data = malloc(sizeof(struct epoll_event_data));
 	data->fd = fd;
+	data->room = room;
 	data->type = EPOLL_EV_READABLE;
-	data->data.read_state = connected_fds[idx].lastread_data;
+	data->data.read_state = room->clients[idx].lastread_data;
 	ep_event.data.ptr = data;
 	ep_event.events = EPOLLIN | EPOLLONESHOT;
 	epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ep_event);
@@ -192,13 +231,14 @@ void backend_newfd(int fd) {
 	memset(si->last_seen_list, 0, sizeof(si->last_seen_list));
 	data = malloc(sizeof(struct epoll_event_data));
 	data->fd = timer;
+	data->room = room;
 	data->type = EPOLL_EV_SEND_START;
 	data->data.send_init = si;
 	ep_event.data.ptr = data;
 	ep_event.events = EPOLLIN | EPOLLONESHOT;
 	epoll_ctl(epoll_fd, EPOLL_CTL_ADD, timer, &ep_event);
-	__atomic_fetch_add(&client_count, 1, __ATOMIC_SEQ_CST);
 	debug_print("Got conn timer: %d, sock: %d\n", timer, fd);
+	__atomic_fetch_add(&room->client_count, 1, __ATOMIC_SEQ_CST);
 }
 
 // Our packets are just 512 bytes of garbage (literally uninitialized memory)
@@ -209,7 +249,7 @@ struct packet {
 	void *data;
 };
 
-static void close_sock(int fd, bool is_sock) {
+static void close_sock(int fd, volatile struct room *room, bool is_sock) {
 	// If we couldn't read, we mark it as closed. We need to search for the correct
 	// element because we don't know the index
 	epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
@@ -217,13 +257,13 @@ static void close_sock(int fd, bool is_sock) {
 		printf("Close error %d\n", errno);
 	}
 	if (is_sock)
-		for (int i = 0; i < fd_idx; i++)
-			if (connected_fds[i].fd == fd)
-				connected_fds[i].open = false;
+		for (int i = 0; i < room->client_idx; i++)
+			if (room->clients[i].fd == fd)
+				room->clients[i].open = false;
 	debug_print("%d removed from epoll list\n", fd);
 }
 
-static enum EP_EV_RETVAL start_send(int send_fd, struct send_start *si) {
+static enum EP_EV_RETVAL start_send(int send_fd, volatile struct room *room, struct send_start *si) {
 	// If there's already a partial send pending, we're gonna let it finish before
 	// we send it more data
 	unsigned long expire_cnt;
@@ -231,13 +271,13 @@ static enum EP_EV_RETVAL start_send(int send_fd, struct send_start *si) {
 	if (__atomic_load_n(&si->send_in_progress, __ATOMIC_SEQ_CST)) {
 		return EP_EV_REARM;
 	}
-	int visited_len = client_count;
+	int visited_len = room->client_count;
 	int visited[visited_len];
 	memset(visited, 0, sizeof(visited));
 	int visited_idx = 0;
 	int client_idx = 0;
 	int spins = 0;
-	int maxspins = client_count * 4;
+	int maxspins = room->client_idx * 4;
 	char *send_buf = malloc(sizeof(char) * (visited_len * BUFLEN));
 	while (visited_idx < visited_len) {
 		// Failsafe in case we're just getting absolutely fucked, we can't stall too long
@@ -246,8 +286,8 @@ static enum EP_EV_RETVAL start_send(int send_fd, struct send_start *si) {
 			break;
 		}
 		// Skip closed sockets
-		if (!connected_fds[client_idx].open) {
-			client_idx = (client_idx + 1) % fd_idx;
+		if (!room->clients[client_idx].open) {
+			client_idx = (client_idx + 1) % room->client_idx;
 			continue;
 		}
 		// Skip sockets that have already been read ("visited")
@@ -260,7 +300,7 @@ static enum EP_EV_RETVAL start_send(int send_fd, struct send_start *si) {
 			}
 		}
 		if (is_visited) {
-			client_idx = (client_idx + 1) % fd_idx;
+			client_idx = (client_idx + 1) % room->client_idx;
 			continue;
 		}
 		// Ok, we haven't seen it before!
@@ -268,9 +308,9 @@ static enum EP_EV_RETVAL start_send(int send_fd, struct send_start *si) {
 		int high_vers_idx;
 		int high_vers = -1;
 		for (int i = 0; i < BUF_CNT; i++) {
-			if (connected_fds[client_idx].lastread_data->buffers[i].version > high_vers) {
+			if (room->clients[client_idx].lastread_data->buffers[i].version > high_vers) {
 				high_vers_idx = i;
-				high_vers = connected_fds[client_idx].lastread_data->buffers[i].version;
+				high_vers = room->clients[client_idx].lastread_data->buffers[i].version;
 			}
 		}
 		// If we've seen this version before, don't send it again
@@ -280,25 +320,25 @@ static enum EP_EV_RETVAL start_send(int send_fd, struct send_start *si) {
 		// This is actual real new data! We can reset the spin counter for this one, because it's ok to spin on failure.
 		spins = 0;
 		// Attempt to read data
-		__atomic_fetch_add(&connected_fds[client_idx].lastread_data->buffers[high_vers_idx].reader_count, 1, __ATOMIC_SEQ_CST);
-		if (__atomic_load_n(&connected_fds[client_idx].lastread_data->buffers[high_vers_idx].write_in_progress, __ATOMIC_SEQ_CST)) {
+		__atomic_fetch_add(&room->clients[client_idx].lastread_data->buffers[high_vers_idx].reader_count, 1, __ATOMIC_SEQ_CST);
+		if (__atomic_load_n(&room->clients[client_idx].lastread_data->buffers[high_vers_idx].write_in_progress, __ATOMIC_SEQ_CST)) {
 			// Fail. Don't add to visited so that we try again.
-			__atomic_fetch_sub(&connected_fds[client_idx].lastread_data->buffers[high_vers_idx].reader_count, 1, __ATOMIC_SEQ_CST);
+			__atomic_fetch_sub(&room->clients[client_idx].lastread_data->buffers[high_vers_idx].reader_count, 1, __ATOMIC_SEQ_CST);
 		} else {
-			memcpy(send_buf + (BUFLEN * visited_idx), (char*)connected_fds[client_idx].lastread_data->buffers[high_vers_idx].buffer, BUFLEN);
-			__atomic_fetch_sub(&connected_fds[client_idx].lastread_data->buffers[high_vers_idx].reader_count, 1, __ATOMIC_SEQ_CST);
+			memcpy(send_buf + (BUFLEN * visited_idx), (char*)room->clients[client_idx].lastread_data->buffers[high_vers_idx].buffer, BUFLEN);
+			__atomic_fetch_sub(&room->clients[client_idx].lastread_data->buffers[high_vers_idx].reader_count, 1, __ATOMIC_SEQ_CST);
 			// Set visited to ensure we don't copy into the buffer again
 			visited[visited_idx += 1] = client_idx;
 			si->last_seen_list[client_idx] = high_vers;
 		}
-		client_idx = (client_idx + 1) % fd_idx;
+		client_idx = (client_idx + 1) % room->client_idx;
 	}
 	debug_print("Sending %d events on %d\n", visited_idx, send_fd);
 	int sent_bytes = send(si->fd, send_buf, BUFLEN * visited_idx, MSG_NOSIGNAL);
 	if (sent_bytes == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
 		printf("Can't send on %d, closing (errno %d)\n", si->fd, errno);
-		close_sock(si->fd, true);
-		close_sock(send_fd, false);
+		close_sock(si->fd, room, true);
+		close_sock(send_fd, room, false);
 		return EP_EV_DONT_REARM;
 	} else if (sent_bytes != BUFLEN * visited_idx) {
 		// Partial send time B-)
@@ -333,14 +373,14 @@ static enum EP_EV_RETVAL start_send(int send_fd, struct send_start *si) {
 	return EP_EV_REARM;
 }
 
-static enum EP_EV_RETVAL send_continue(struct send_progress *ss) {
+static enum EP_EV_RETVAL send_continue(volatile struct room *room, struct send_progress *ss) {
 	debug_print("GOT SEND CONT %d of %d bytes\n", ss->send_fd, ss->data_length - ss->next_byte_idx);
 	int sent_bytes = send(ss->send_fd, ss->data + ss->next_byte_idx, ss->data_length - ss->next_byte_idx, MSG_NOSIGNAL);
 	if (sent_bytes == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
 		__atomic_store_n(ss->send_in_progress, true, __ATOMIC_SEQ_CST);
 		printf("Can't send on %d, closing\n", ss->send_fd);
-		close_sock(ss->send_fd, false);
-		close_sock(ss->original_fd, true);
+		close_sock(ss->send_fd, room, false);
+		close_sock(ss->original_fd, room, true);
 		free(ss->data);
 		free(ss);
 		return EP_EV_DONT_REARM;
@@ -351,7 +391,7 @@ static enum EP_EV_RETVAL send_continue(struct send_progress *ss) {
 		if (ss->next_byte_idx == ss->data_length) {
 			__atomic_store_n(ss->send_in_progress, true, __ATOMIC_SEQ_CST);
 			printf("Send complete on %d, closing\n", ss->send_fd);
-			close_sock(ss->send_fd, false);
+			close_sock(ss->send_fd, room, false);
 			free(ss->data);
 			free(ss);
 			return EP_EV_DONT_REARM;
@@ -362,54 +402,61 @@ static enum EP_EV_RETVAL send_continue(struct send_progress *ss) {
 	}
 }
 
-static enum EP_EV_RETVAL recv_idk(int recv_fd, volatile struct client_lastread *lr) {
-	// HANDLE THE PARTIAL READ CASE (I think this actually should work but idk)
+static enum EP_EV_RETVAL recv_idk(int recv_fd, volatile struct room *room, volatile struct client_lastread *lr) {
 	int low_vers_idx = -1;
-	int rcv_hotbuf_len = 0;
-	char rcv_hotbuf[BUFLEN];
+	// Find lowest vers buf
 	for (int i = 0; i < BUF_CNT; i++)
 		if (lr->buffers[i].version < low_vers_idx || low_vers_idx == -1)
 			low_vers_idx = i;
+
+	// Mark write in progress pre-emptively
 	__atomic_store_n(&lr->buffers[low_vers_idx].write_in_progress, true, __ATOMIC_SEQ_CST);
+
+	// Wait for reader count to drop to 0 (and try to recv into hotbuf in the meantime)
+	int rcv_hotbuf_len = 0;
+	int rcv_hotbuf_cap = BUFLEN - lr->write_progress;
+	char rcv_hotbuf[BUFLEN];
 	while (__atomic_load_n(&lr->buffers[low_vers_idx].reader_count, __ATOMIC_SEQ_CST) > 0) {
-		if (rcv_hotbuf_len < BUFLEN) {
-			int rcv_rv = recv(recv_fd, rcv_hotbuf + rcv_hotbuf_len, BUFLEN - rcv_hotbuf_len, 0x0);
+		if (rcv_hotbuf_len < rcv_hotbuf_cap) {
+			int rcv_rv = recv(recv_fd, rcv_hotbuf + rcv_hotbuf_len, rcv_hotbuf_cap - rcv_hotbuf_len, 0x0);
 			if (rcv_rv == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
 				printf("Bad sock close\n");
 				__atomic_store_n(&lr->buffers[low_vers_idx].write_in_progress, false, __ATOMIC_SEQ_CST);
-				close_sock(recv_fd, true);
+				close_sock(recv_fd, room, true);
 				return EP_EV_DONT_REARM;
 			} else if (rcv_rv == 0) {
-				printf("Good sock close\n");
+				printf("Good sock close %d\n", recv_fd);
 				__atomic_store_n(&lr->buffers[low_vers_idx].write_in_progress, false, __ATOMIC_SEQ_CST);
-				close_sock(recv_fd, true);
+				close_sock(recv_fd, room, true);
 				return EP_EV_DONT_REARM;
 			} else {
 				rcv_hotbuf_len += rcv_rv;
 			}
 		}
 	}
-	int rcv_rv;
+	// Readers at 0 now!
+	// Either append the hotbuf stuff or give one more try and a recv
 	if (rcv_hotbuf_len == 0) {
-		rcv_rv = recv(recv_fd, (char*)lr->buffers[low_vers_idx].buffer + lr->write_progress, BUFLEN - lr->write_progress, 0x0);
+		int rcv_rv = recv(recv_fd, (char*)lr->buffers[low_vers_idx].buffer + lr->write_progress, BUFLEN - lr->write_progress, 0x0);
 		if (rcv_rv == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
 			printf("Bad sock close\n");
-			close_sock(recv_fd, true);
+			close_sock(recv_fd, room, true);
 			__atomic_store_n(&lr->buffers[low_vers_idx].write_in_progress, false, __ATOMIC_SEQ_CST);
 			return EP_EV_DONT_REARM;
 		} else if (rcv_rv == 0) {
-			printf("Good sock close\n");
+			printf("Good sock close 2 %d (%d)\n", recv_fd, BUFLEN - lr->write_progress);
 			__atomic_store_n(&lr->buffers[low_vers_idx].write_in_progress, false, __ATOMIC_SEQ_CST);
-			close_sock(recv_fd, true);
+			close_sock(recv_fd, room, true);
 			return EP_EV_DONT_REARM;
+		} else {
+			lr->write_progress += rcv_rv;
 		}
 	} else {
-		memcpy((char*)lr->buffers[low_vers_idx].buffer, rcv_hotbuf, rcv_hotbuf_len);
-		rcv_rv = rcv_hotbuf_len;
+		memcpy((char*)lr->buffers[low_vers_idx].buffer + lr->write_progress, rcv_hotbuf, rcv_hotbuf_len);
+		lr->write_progress += rcv_hotbuf_len;
 	}
 
-	if (rcv_rv != BUFLEN) {
-		lr->write_progress += rcv_rv;
+	if (lr->write_progress != BUFLEN) {
 		debug_print("Recv progress %d on %d\n", lr->write_progress, recv_fd);
 	} else {
 		__atomic_store_n(&lr->write_progress, 0, __ATOMIC_RELAXED);
@@ -430,7 +477,7 @@ void *threadpool_thread(void *_v) {
 		ev_data = ep_ev.data.ptr;
 		switch (ev_data->type) {
 			case EPOLL_EV_SEND_START : {
-				switch (start_send(ev_data->fd, ev_data->data.send_init)) {
+				switch (start_send(ev_data->fd, ev_data->room, ev_data->data.send_init)) {
 					case EP_EV_REARM:
 						ep_ev.events = EPOLLIN | EPOLLONESHOT;
 						if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, ev_data->fd, &ep_ev) != 0) {
@@ -442,7 +489,7 @@ void *threadpool_thread(void *_v) {
 				break;
 			}
 			case EPOLL_EV_SEND_CONTINUE : {
-				switch (send_continue(ev_data->data.send_state)) {
+				switch (send_continue(ev_data->room, ev_data->data.send_state)) {
 					case EP_EV_REARM:
 						ep_ev.events = EPOLLOUT | EPOLLONESHOT;
 						if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, ev_data->fd, &ep_ev) != 0) {
@@ -456,7 +503,7 @@ void *threadpool_thread(void *_v) {
 				break;
 			}
 			case EPOLL_EV_READABLE : {
-				switch (recv_idk(ev_data->fd, ev_data->data.read_state)) {
+				switch (recv_idk(ev_data->fd, ev_data->room, ev_data->data.read_state)) {
 					case EP_EV_REARM:
 						ep_ev.events = EPOLLIN | EPOLLONESHOT;
 						if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, ev_data->fd, &ep_ev) != 0) {

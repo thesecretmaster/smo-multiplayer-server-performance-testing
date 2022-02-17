@@ -46,6 +46,19 @@ void *client_thread(void *_args) {
 	}
 
 	printf("Connected to %s on port %d\n", host, port);
+	char auth_buf[4] = "1";
+	int sent_count = 0;
+	while (sent_count < 4) {
+		int rv = send(sockfd, auth_buf, 4, 0);
+		if (rv <= 0) {
+			printf("Could not start socket\n");
+			close(sockfd);
+			return NULL;
+		} else {
+			sent_count += rv;
+		}
+	}
+	printf("Sent auth packet (%s)\n", auth_buf);
 
 	char buf[BUFLEN];
 	int sent_len, retval;
@@ -53,9 +66,12 @@ void *client_thread(void *_args) {
 	struct timeval last_send_tv, current_tv;
 	char recv_buf[BUFLEN];
 	bool saw_my_packet;
+	int seen_pack_cnt;
+	int last_pack_id = -1;
 	pthread_t my_pid = pthread_self();
 	pthread_t recv_pid;
 	int recv_id;
+	bool saw_anything;
 	fcntl(sockfd, F_SETFL, O_NONBLOCK);
 	while (true) {
 		sent_len = 0;
@@ -63,12 +79,12 @@ void *client_thread(void *_args) {
 		// printf("Sending packet %d\n", i);
 		snprintf(buf, BUFLEN, "%lu %d", my_pid, i);
 		while (sent_len < BUFLEN) {
-			retval = send(sockfd, buf + sent_len, BUFLEN - sent_len, 0x0);
+			retval = send(sockfd, buf + sent_len, BUFLEN - sent_len, MSG_NOSIGNAL);
 			if (retval < 0) {
 				if (errno == EAGAIN || errno == EWOULDBLOCK) {
 					sched_yield();
-				} else  {
-					printf("Send error\n");
+				} else {
+					printf("Send error %d\n", errno);
 					return NULL;
 				}
 			} else {
@@ -76,10 +92,10 @@ void *client_thread(void *_args) {
 			}
 		}
 		// printf("Done send\n");
-		if (retval < 0)
-			break;
 		saw_my_packet = false;
+		saw_anything = false;
 		gettimeofday(&last_send_tv, NULL);
+		seen_pack_cnt = 0;
 		do {
 			// printf("Recive packet\n");
 			retval = recv(sockfd, recv_buf, sizeof(recv_buf), MSG_WAITALL);
@@ -87,19 +103,32 @@ void *client_thread(void *_args) {
 				if (errno == EAGAIN || errno == EWOULDBLOCK) {
 					sched_yield();
 				} else {
-					printf("Recieve error\n");
+					printf("Recieve error %d\n", errno);
 					return NULL;
 				}
 			} else {
+				saw_anything = true;
 				sscanf(recv_buf, "%lu %d", &recv_pid, &recv_id);
-				if (recv_pid == my_pid)
+				if (recv_pid == my_pid) {
+					seen_pack_cnt += 1;
 					saw_my_packet = true;
+					if (last_pack_id != -1) {
+						if (last_pack_id == recv_id) {
+							// printf("Saw it twice\n");
+						} else if (last_pack_id + 1 != recv_id) {
+							printf("Sequence break %d -> %d\n", last_pack_id, recv_id);
+						}
+					}
+					last_pack_id = recv_id;
+				}
 			}
 			// printf("iDone Recive packet\n");
 			gettimeofday(&current_tv, NULL);
 		} while (1000000 * current_tv.tv_sec + current_tv.tv_usec < 1000000 * last_send_tv.tv_sec + last_send_tv.tv_usec + WAIT_TIME);
-		if (!saw_my_packet)
+		if (!saw_my_packet && saw_anything)
 			printf("Did not see my packet!\n");
+		// if (seen_pack_cnt > 1)
+		// 	printf("Saw %d packets\n", seen_pack_cnt);
 		i += 1;
 	}
 	printf("Exiting\n");
