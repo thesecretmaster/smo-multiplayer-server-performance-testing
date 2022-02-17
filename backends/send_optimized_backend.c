@@ -106,9 +106,14 @@ struct fd_info {
 	volatile struct client_lastread *lastread_data;
 };
 
+struct room_settings {
+	bool instasend;
+};
+
 struct room {
 	int client_count;
 	int client_idx;
+	struct room_settings settings;
 	struct fd_info clients[MAX_CLIENT_COUNT];
 };
 
@@ -139,6 +144,7 @@ static struct room *room_init() {
 	struct room *room = malloc(sizeof(struct room));
 	room->client_count = 0;
 	room->client_idx = 0;
+	room->settings.instasend = true;
 	for (int i = 0; i < sizeof(room->clients) / sizeof(room->clients[0]); i++) {
 		room->clients[i].fd = -1;
 		room->clients[i].open = false;
@@ -214,29 +220,32 @@ void backend_newfd(int fd) {
 	ep_event.events = EPOLLIN | EPOLLONESHOT;
 	epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ep_event);
 
-	// Start the send timer! We try to send once very 1/20 of a second
-	int timer = timerfd_create(CLOCK_REALTIME, 0x0);
-	const struct timespec send_rate = {
-		.tv_sec = 0,
-		.tv_nsec = 30000000 + (rand() % 100000)
-	};
-	const struct itimerspec ts = {
-		.it_interval = send_rate,
-		.it_value = send_rate
-	};
-	timerfd_settime(timer, 0x0, &ts, NULL);
-	struct send_start *si = malloc(sizeof(struct send_start));
-	si->fd = fd;
-	si->send_in_progress = false;
-	memset(si->last_seen_list, 0, sizeof(si->last_seen_list));
-	data = malloc(sizeof(struct epoll_event_data));
-	data->fd = timer;
-	data->room = room;
-	data->type = EPOLL_EV_SEND_START;
-	data->data.send_init = si;
-	ep_event.data.ptr = data;
-	ep_event.events = EPOLLIN | EPOLLONESHOT;
-	epoll_ctl(epoll_fd, EPOLL_CTL_ADD, timer, &ep_event);
+	int timer = -1;
+	if (!room->settings.instasend) {
+		// Start the send timer! We try to send once very 1/20 of a second
+		timer = timerfd_create(CLOCK_REALTIME, 0x0);
+		const struct timespec send_rate = {
+			.tv_sec = 0,
+			.tv_nsec = 30000000 + (rand() % 100000)
+		};
+		const struct itimerspec ts = {
+			.it_interval = send_rate,
+			.it_value = send_rate
+		};
+		timerfd_settime(timer, 0x0, &ts, NULL);
+		struct send_start *si = malloc(sizeof(struct send_start));
+		si->fd = fd;
+		si->send_in_progress = false;
+		memset(si->last_seen_list, 0, sizeof(si->last_seen_list));
+		data = malloc(sizeof(struct epoll_event_data));
+		data->fd = timer;
+		data->room = room;
+		data->type = EPOLL_EV_SEND_START;
+		data->data.send_init = si;
+		ep_event.data.ptr = data;
+		ep_event.events = EPOLLIN | EPOLLONESHOT;
+		epoll_ctl(epoll_fd, EPOLL_CTL_ADD, timer, &ep_event);
+	}
 	debug_print("Got conn timer: %d, sock: %d\n", timer, fd);
 	__atomic_fetch_add(&room->client_count, 1, __ATOMIC_SEQ_CST);
 }
@@ -468,6 +477,47 @@ static enum EP_EV_RETVAL recv_idk(int recv_fd, volatile struct room *room, volat
 	return EP_EV_REARM;
 }
 
+static enum EP_EV_RETVAL instasend_handler(int recv_fd, volatile struct room *room) {
+	int retval, sent_len;
+	char buf[BUFLEN];
+	struct packet packet;
+	packet.length = sizeof(buf);
+	// Read the packet from the descriptor
+	retval = recv(recv_fd, buf, BUFLEN, MSG_WAITALL);
+	if (retval > 0) {
+		debug_print("%d: Got packet %s\n", recv_fd, buf);
+		// Send the packet out to every socket that is currently connected
+		for (int i = 0; i < room->client_idx; i++) {
+			// Skip if the connection is closed
+			if (!room->clients[i].open)
+				continue;
+			packet.src_fd = recv_fd;
+			packet.data = buf;
+
+			// Handle partial threads
+			sent_len = 0;
+			while (sent_len < packet.length) {
+				retval = send(room->clients[i].fd, packet.data + sent_len, packet.length - sent_len, MSG_NOSIGNAL);
+				if (retval == 0 || (retval < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+					printf("Instasend close %d=%d (%d)\n", recv_fd, retval, errno);
+					close_sock(recv_fd, room, true);
+					return EP_EV_DONT_REARM;
+				} else {
+					sent_len += retval;
+				}
+			}
+		}
+		debug_print("%d: Finished sending out packet %s\n", recv_fd, buf);
+		return EP_EV_REARM;
+	} else {
+		// If we couldn't read, we mark it as closed. We need to search for the correct
+		// element because we don't know the index
+		printf("Instasend close %d=%d (%d)\n", recv_fd, retval, errno);
+		close_sock(recv_fd, room, true);
+		return EP_EV_DONT_REARM;
+	}
+}
+
 void *threadpool_thread(void *_v) {
 	struct epoll_event ep_ev;
 	struct epoll_event_data *ev_data;
@@ -503,13 +553,26 @@ void *threadpool_thread(void *_v) {
 				break;
 			}
 			case EPOLL_EV_READABLE : {
-				switch (recv_idk(ev_data->fd, ev_data->room, ev_data->data.read_state)) {
-					case EP_EV_REARM:
-						ep_ev.events = EPOLLIN | EPOLLONESHOT;
-						if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, ev_data->fd, &ep_ev) != 0) {
-							printf("Error adding recv back to epoll %d\n", errno);
-						}
-					case EP_EV_DONT_REARM: break;
+				if (ev_data->room->settings.instasend) {
+					switch (instasend_handler(ev_data->fd, ev_data->room)) {
+						case EP_EV_REARM:
+							// Readd the fd to the epoll descriptor because EPOLLONESHOT requires it
+							ep_ev.events = EPOLLIN | EPOLLONESHOT;
+							if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, ev_data->fd, &ep_ev) != 0) {
+								printf("Error adding recv back to epoll %d\n", errno);
+							}
+							break;
+						case EP_EV_DONT_REARM: break;
+					}
+				} else {
+					switch (recv_idk(ev_data->fd, ev_data->room, ev_data->data.read_state)) {
+						case EP_EV_REARM:
+							ep_ev.events = EPOLLIN | EPOLLONESHOT;
+							if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, ev_data->fd, &ep_ev) != 0) {
+								printf("Error adding recv back to epoll %d\n", errno);
+							}
+						case EP_EV_DONT_REARM: break;
+					}
 				}
 				break;
 			}
