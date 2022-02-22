@@ -137,7 +137,7 @@ void backend_setup(void) {
 
 	// Spawn all of the threads for the threadpool, one for each CPU core
 	pthread_t pid;
-	for (int i = 0; i < get_nprocs(); i++)
+	for (int i = 0; i < 2/*get_nprocs()*/; i++)
 		pthread_create(&pid, NULL, &threadpool_thread, NULL);
 }
 
@@ -161,7 +161,7 @@ static struct client_lastread *lastread_init() {
 	d->write_progress = 0;
 	d->version_ctr = 0;
 	for (int i = 0; i < BUF_CNT; i++) {
-		d->buffers[i].version = 0;
+		d->buffers[i].version = -1;
 		d->buffers[i].reader_count = 0;
 		d->buffers[i].write_in_progress = false;
 		memset(d->buffers[i].buffer, 0x0, sizeof(d->buffers[i].buffer));
@@ -231,7 +231,7 @@ void backend_newfd(int fd) {
 		timer = timerfd_create(CLOCK_REALTIME, 0x0);
 		const struct timespec send_rate = {
 			.tv_sec = 0,
-			.tv_nsec = 30000000 + (rand() % 100000)
+			.tv_nsec = 10000000 + (rand() % 1000000)
 		};
 		const struct itimerspec ts = {
 			.it_interval = send_rate,
@@ -327,8 +327,14 @@ static enum EP_EV_RETVAL start_send(int send_fd, volatile struct room *room, str
 				high_vers = room->clients[client_idx].lastread_data->buffers[i].version;
 			}
 		}
+		// If there's no data ever, don't send
+		if (high_vers == -1) {
+			client_idx = (client_idx + 1) % room->client_idx;
+			continue;
+		}
 		// If we've seen this version before, don't send it again
 		if (si->last_seen_list[client_idx] >= high_vers) {
+			client_idx = (client_idx + 1) % room->client_idx;
 			continue;
 		}
 		// This is actual real new data! We can reset the spin counter for this one, because it's ok to spin on failure.
@@ -339,6 +345,7 @@ static enum EP_EV_RETVAL start_send(int send_fd, volatile struct room *room, str
 			// Fail. Don't add to visited so that we try again.
 			__atomic_fetch_sub(&room->clients[client_idx].lastread_data->buffers[high_vers_idx].reader_count, 1, __ATOMIC_SEQ_CST);
 		} else {
+			debug_print("Adding %s to send buf (%p, %d)\n", room->clients[client_idx].lastread_data->buffers[high_vers_idx].buffer, room->clients[client_idx].lastread_data, room->clients[client_idx].lastread_data->buffers[high_vers_idx].version);
 			memcpy(send_buf + (BUFLEN * visited_idx), (char*)room->clients[client_idx].lastread_data->buffers[high_vers_idx].buffer, BUFLEN);
 			__atomic_fetch_sub(&room->clients[client_idx].lastread_data->buffers[high_vers_idx].reader_count, 1, __ATOMIC_SEQ_CST);
 			// Set visited to ensure we don't copy into the buffer again
@@ -433,11 +440,13 @@ static enum EP_EV_RETVAL recv_idk(int recv_fd, volatile struct room *room, volat
 	while (__atomic_load_n(&lr->buffers[low_vers_idx].reader_count, __ATOMIC_SEQ_CST) > 0) {
 		if (rcv_hotbuf_len < rcv_hotbuf_cap) {
 			int rcv_rv = recv(recv_fd, rcv_hotbuf + rcv_hotbuf_len, rcv_hotbuf_cap - rcv_hotbuf_len, 0x0);
-			if (rcv_rv == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
-				printf("Bad sock close\n");
-				__atomic_store_n(&lr->buffers[low_vers_idx].write_in_progress, false, __ATOMIC_SEQ_CST);
-				close_sock(recv_fd, room, true);
-				return EP_EV_DONT_REARM;
+			if (rcv_rv == -1) {
+				if (errno != EAGAIN && errno != EWOULDBLOCK) {
+					printf("Bad sock close\n");
+					__atomic_store_n(&lr->buffers[low_vers_idx].write_in_progress, false, __ATOMIC_SEQ_CST);
+					close_sock(recv_fd, room, true);
+					return EP_EV_DONT_REARM;
+				}
 			} else if (rcv_rv == 0) {
 				printf("Good sock close %d\n", recv_fd);
 				__atomic_store_n(&lr->buffers[low_vers_idx].write_in_progress, false, __ATOMIC_SEQ_CST);
@@ -452,11 +461,13 @@ static enum EP_EV_RETVAL recv_idk(int recv_fd, volatile struct room *room, volat
 	// Either append the hotbuf stuff or give one more try and a recv
 	if (rcv_hotbuf_len == 0) {
 		int rcv_rv = recv(recv_fd, (char*)lr->buffers[low_vers_idx].buffer + lr->write_progress, BUFLEN - lr->write_progress, 0x0);
-		if (rcv_rv == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
-			printf("Bad sock close\n");
-			close_sock(recv_fd, room, true);
-			__atomic_store_n(&lr->buffers[low_vers_idx].write_in_progress, false, __ATOMIC_SEQ_CST);
-			return EP_EV_DONT_REARM;
+		if (rcv_rv == -1) {
+			if (errno != EAGAIN && errno != EWOULDBLOCK) {
+				printf("Bad sock close\n");
+				close_sock(recv_fd, room, true);
+				__atomic_store_n(&lr->buffers[low_vers_idx].write_in_progress, false, __ATOMIC_SEQ_CST);
+				return EP_EV_DONT_REARM;
+			}
 		} else if (rcv_rv == 0) {
 			printf("Good sock close 2 %d (%d)\n", recv_fd, BUFLEN - lr->write_progress);
 			__atomic_store_n(&lr->buffers[low_vers_idx].write_in_progress, false, __ATOMIC_SEQ_CST);
@@ -477,6 +488,7 @@ static enum EP_EV_RETVAL recv_idk(int recv_fd, volatile struct room *room, volat
 		__atomic_store_n(&lr->buffers[low_vers_idx].write_in_progress, false, __ATOMIC_SEQ_CST);
 		int next_vers = __atomic_add_fetch(&lr->version_ctr, 1, __ATOMIC_RELAXED);
 		__atomic_store_n(&lr->buffers[low_vers_idx].version, next_vers, __ATOMIC_SEQ_CST);
+		debug_print("Wrote %s to recv buf (%p %d)\n", lr->buffers[low_vers_idx].buffer, lr, next_vers);
 		debug_print("Recv complete on %d\n", recv_fd);
 	}
 	return EP_EV_REARM;
