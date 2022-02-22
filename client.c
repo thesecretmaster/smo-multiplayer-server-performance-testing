@@ -77,6 +77,7 @@ void *client_thread(void *_args) {
   char auth_buf[4] = "928";
   int sent_count = 0;
   while (sent_count < sizeof(auth_buf) - 1) {
+    printf("AUTH SEND\n");
     int rv = send(sockfd, auth_buf, sizeof(auth_buf) - 1, 0);
     if (rv <= 0) {
       printf("Could not start socket\n");
@@ -116,59 +117,82 @@ void *client_thread(void *_args) {
     gettimeofday(&current_tv, NULL);
     memset(buf, 0, BUFLEN);
     if (1000000 * current_tv.tv_sec + current_tv.tv_usec > 1000000 * last_send_tv.tv_sec + last_send_tv.tv_usec + WAIT_TIME) {
-      int sent_len = 0;
-      int r = snprintf(buf, BUFLEN, "%d %d", my_id, my_idx);
-      while (sent_len < BUFLEN) {
-        int retval = send(sockfd, buf + sent_len, BUFLEN - sent_len, MSG_NOSIGNAL);
+      int r;
+      if ((r = snprintf(buf, BUFLEN, "%d %d", my_id, my_idx)) >= 2) {
+        int sent_len = 0;
+        while (sent_len < BUFLEN) {
+          int retval = send(sockfd, buf + sent_len, BUFLEN - sent_len, MSG_NOSIGNAL);
+          if (retval < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+              sched_yield();
+            } else {
+              printf("Send error %d\n", errno);
+              return NULL;
+            }
+          } else {
+            sent_len += retval;
+          }
+        }
+        // printf("%d: Sent pack %d %d\n", my_id, my_id, my_idx);
+        last_send_tv = current_tv;
+        my_idx += 1;
+      } else {
+        printf("snprintf error %d %d | %d %d\n", r, errno, my_id, my_idx);
+      }
+    } else {
+      int retval;
+      int recv_len = 0;
+      while (recv_len < BUFLEN) {
+        retval = recv(sockfd, buf + recv_len, BUFLEN - recv_len, MSG_WAITALL);
         if (retval < 0) {
           if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            sched_yield();
+            if (recv_len == 0) {
+              break;
+            } else {
+              sched_yield();
+            }
           } else {
-            printf("Send error %d\n", errno);
+            printf("Recv error %d\n", errno);
             return NULL;
           }
+        } else if (retval == 0) {
+          printf("Clean close %d\n", sockfd);
+          return NULL;
         } else {
-          sent_len += retval;
+          recv_len += retval;
         }
       }
-      //printf("%d: Sent pack %d %d\n", my_id, my_id, my_idx);
-      last_send_tv = current_tv;
-      my_idx += 1;
-    } else {
-      int retval = recv(sockfd, buf, sizeof(buf), MSG_WAITALL);
       int recv_id, recv_idx;
-      if (retval < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-          sched_yield();
-        } else {
-          printf("Recieve error %d\n", errno);
-          return NULL;
-        }
-      } else {
-        sscanf(buf, "%d %d", &recv_id, &recv_idx);
-        // printf("%d: Got pack %d %d\n", my_id, recv_id, recv_idx);
-        if (d[recv_id].last_seen_id == -1) {
-          d[recv_id].last_seen_id = recv_idx;
-          d[recv_id].last_seen_tv = current_tv;
-        } else {
-          if (recv_idx == d[recv_id].last_seen_id) {
-            d[recv_id].dup_count += 1;
-          } else if (recv_idx > d[recv_id].last_seen_id + 1) {
-            d[recv_id].skip_count += 1;
+      if (recv_len != 0) {
+        int se;
+        if ((se = sscanf(buf, "%d %d", &recv_id, &recv_idx)) >= 2) {
+          // printf("%d: Got pack %d %d\n", my_id, recv_id, recv_idx);
+          if (d[recv_id].last_seen_id == -1) {
+            d[recv_id].last_seen_id = recv_idx;
+            d[recv_id].last_seen_tv = current_tv;
           } else {
-            d[recv_id].norm_count += 1;
+            if (recv_idx == d[recv_id].last_seen_id) {
+              d[recv_id].dup_count += 1;
+            } else if (recv_idx > d[recv_id].last_seen_id + 1) {
+              d[recv_id].skip_count += 1;
+            } else {
+              d[recv_id].norm_count += 1;
+            }
+            d[recv_id].last_seen_id = recv_idx;
+            int ms_diff = msdiff(&current_tv, &d[recv_id].last_seen_tv);
+            d[recv_id].ms_latency_buffer[d[recv_id].ms_latency_idx] = ms_diff;
+            d[recv_id].ms_latency_idx = (d[recv_id].ms_latency_idx + 1) % LATENCY_BUFSZ;
+            if (ms_diff < d[recv_id].min_ms_latency) {
+              d[recv_id].min_ms_latency = ms_diff;
+            }
+            if (ms_diff > d[recv_id].max_ms_latency) {
+              d[recv_id].max_ms_latency = ms_diff;
+            }
+            d[recv_id].last_seen_tv = current_tv;
           }
-          d[recv_id].last_seen_id = recv_idx;
-          int ms_diff = msdiff(&current_tv, &d[recv_id].last_seen_tv);
-          d[recv_id].ms_latency_buffer[d[recv_id].ms_latency_idx] = ms_diff;
-          d[recv_id].ms_latency_idx = (d[recv_id].ms_latency_idx + 1) % LATENCY_BUFSZ;
-          if (ms_diff < d[recv_id].min_ms_latency) {
-            d[recv_id].min_ms_latency = ms_diff;
-          }
-          if (ms_diff > d[recv_id].max_ms_latency) {
-            d[recv_id].max_ms_latency = ms_diff;
-          }
-          d[recv_id].last_seen_tv = current_tv;
+        }
+        else {
+          printf("%d: sscanf error %d %d %d %s\n", my_id, se, errno, retval, buf);
         }
       }
     }
