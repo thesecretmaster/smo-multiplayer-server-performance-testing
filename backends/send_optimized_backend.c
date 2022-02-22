@@ -349,7 +349,8 @@ static enum EP_EV_RETVAL start_send(int send_fd, volatile struct room *room, str
 			memcpy(send_buf + (BUFLEN * visited_idx), (char*)room->clients[client_idx].lastread_data->buffers[high_vers_idx].buffer, BUFLEN);
 			__atomic_fetch_sub(&room->clients[client_idx].lastread_data->buffers[high_vers_idx].reader_count, 1, __ATOMIC_SEQ_CST);
 			// Set visited to ensure we don't copy into the buffer again
-			visited[visited_idx += 1] = client_idx;
+			visited[visited_idx] = client_idx;
+			visited_idx += 1;
 			si->last_seen_list[client_idx] = high_vers;
 		}
 		client_idx = (client_idx + 1) % room->client_idx;
@@ -424,11 +425,15 @@ static enum EP_EV_RETVAL send_continue(volatile struct room *room, struct send_p
 }
 
 static enum EP_EV_RETVAL recv_idk(int recv_fd, volatile struct room *room, volatile struct client_lastread *lr) {
-	int low_vers_idx = -1;
+	int low_vers_idx;
+	int low_vers = -2;
 	// Find lowest vers buf
-	for (int i = 0; i < BUF_CNT; i++)
-		if (lr->buffers[i].version < low_vers_idx || low_vers_idx == -1)
+	for (int i = 0; i < BUF_CNT; i++) {
+		if (lr->buffers[i].version < low_vers || low_vers == -2) {
 			low_vers_idx = i;
+			low_vers = lr->buffers[i].version;
+		}
+	}
 
 	// Mark write in progress pre-emptively
 	__atomic_store_n(&lr->buffers[low_vers_idx].write_in_progress, true, __ATOMIC_SEQ_CST);
